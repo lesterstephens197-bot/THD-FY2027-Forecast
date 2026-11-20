@@ -32,14 +32,14 @@ MONTH_COLS_26 = [f"26_{m}月" for m in range(1, 13)]
 MONTH_COLS_27 = [f"27_{m}月" for m in range(1, 13)]
 
 # ---------------------------------------------------------
-# 2. 数据清洗与双渠道 SKU 对齐引擎
+# 2. 数据清洗与双渠道 SKU 对齐引擎（VDF: 产品SKU | DF: 发货产品）
 # ---------------------------------------------------------
 @st.cache_data
 def load_and_normalize_data(vdf_file, df_file, exclude_cancelled=True):
     frames = []
     sku_meta_map = {}
 
-    # --- 处理 VDF 数据 ---
+    # --- 处理 VDF 数据（主 SKU 字段：产品SKU） ---
     if vdf_file is not None:
         vdf = pd.read_excel(vdf_file) if vdf_file.name.endswith(('xlsx', 'xls')) else pd.read_csv(vdf_file)
         vdf.columns = vdf.columns.str.strip()
@@ -47,13 +47,22 @@ def load_and_normalize_data(vdf_file, df_file, exclude_cancelled=True):
         if exclude_cancelled and 'Line Status' in vdf.columns:
             vdf = vdf[~vdf['Line Status'].astype(str).str.lower().isin(['cancelled', 'canceled', 'rejected'])]
         
-        # 提取 VDF 的 SKU 维度主数据（品牌、属性、品名、定位）
-        meta_cols = [c for c in ['产品SKU', '品牌', '产品属性', '产品名称', '产品定位'] if c in vdf.columns]
+        meta_cols = [c for c in ['产品SKU', 'Vendor SKU', '品牌', '产品属性', '产品名称', '产品定位'] if c in vdf.columns]
         if '产品SKU' in meta_cols:
             meta_df = vdf[meta_cols].dropna(subset=['产品SKU']).copy()
             meta_df['产品SKU'] = meta_df['产品SKU'].astype(str).str.strip()
-            meta_df = meta_df.drop_duplicates(subset=['产品SKU'])
-            sku_meta_map = meta_df.set_index('产品SKU').to_dict('index')
+            for _, row in meta_df.iterrows():
+                info = {
+                    '品牌': row.get('品牌', 'Unknown') if pd.notna(row.get('品牌')) else 'Unknown',
+                    '产品属性': row.get('产品属性', '未分类') if pd.notna(row.get('产品属性')) else '未分类',
+                    '产品名称': row.get('产品名称', '') if pd.notna(row.get('产品名称')) else '',
+                    '产品定位': row.get('产品定位', '常规款') if pd.notna(row.get('产品定位')) else '常规款',
+                }
+                sku_meta_map[row['产品SKU']] = info
+                if 'Vendor SKU' in row and pd.notna(row['Vendor SKU']):
+                    v_sku = str(row['Vendor SKU']).strip()
+                    if v_sku and v_sku not in sku_meta_map:
+                        sku_meta_map[v_sku] = info
 
         vdf_norm = pd.DataFrame({
             'Channel': 'VDF',
@@ -70,25 +79,42 @@ def load_and_normalize_data(vdf_file, df_file, exclude_cancelled=True):
         })
         frames.append(vdf_norm)
 
-    # --- 处理 DF 数据 ---
+    # --- 处理 DF 数据（核心口径：发货产品，缺失时回退 产品SKU） ---
     if df_file is not None:
         df_raw = pd.read_excel(df_file) if df_file.name.endswith(('xlsx', 'xls')) else pd.read_csv(df_file)
         df_raw.columns = df_raw.columns.str.strip()
         
-        skus = df_raw['产品SKU'].astype(str).str.strip()
+        ship_sku_raw = df_raw['发货产品'].astype(str).str.strip() if '发货产品' in df_raw.columns else pd.Series(['']*len(df_raw))
+        fallback_sku_raw = df_raw['产品SKU'].astype(str).str.strip() if '产品SKU' in df_raw.columns else pd.Series(['']*len(df_raw))
+        
+        skus = np.where(
+            (ship_sku_raw != '') & (~ship_sku_raw.str.lower().isin(['nan', 'none', 'null'])),
+            ship_sku_raw,
+            fallback_sku_raw
+        )
+        skus = pd.Series(skus, index=df_raw.index).astype(str).str.strip()
+
+        # 若 DF 表中自身带有“产品SKU”与“产品属性/品牌”对应关系，补充进映射字典
+        if '产品SKU' in df_raw.columns:
+            for i in range(len(df_raw)):
+                s_ship = skus.iloc[i]
+                s_orig = fallback_sku_raw.iloc[i]
+                if s_orig and s_orig in sku_meta_map and s_ship and s_ship not in sku_meta_map:
+                    sku_meta_map[s_ship] = sku_meta_map[s_orig]
+
         qty = pd.to_numeric(df_raw['下单数量'], errors='coerce').fillna(0)
         unit_p = pd.to_numeric(df_raw['折后供货价'], errors='coerce').fillna(0)
         
         raw_sales = pd.to_numeric(df_raw.get('总销售额', 0), errors='coerce').fillna(0)
         sales = np.where(raw_sales > 0, raw_sales, qty * unit_p)
 
-        # 继承 VDF 中的品牌与属性，若 VDF 中无此 SKU 则标记为 DF专属
         brands = [sku_meta_map.get(s, {}).get('品牌', 'DF品牌(待归类)') for s in skus]
         cats = [sku_meta_map.get(s, {}).get('产品属性', 'DF通用属性') for s in skus]
         pos = [sku_meta_map.get(s, {}).get('产品定位', '常规款') for s in skus]
+        desc_series = df_raw.get('产品描述', pd.Series(['']*len(skus)))
         names = [
-            df_raw.get('产品描述', pd.Series(['']*len(skus))).iloc[i] 
-            if pd.notna(df_raw.get('产品描述', pd.Series([None]*len(skus))).iloc[i]) 
+            desc_series.iloc[i]
+            if pd.notna(desc_series.iloc[i]) and str(desc_series.iloc[i]).strip() != ''
             else sku_meta_map.get(skus.iloc[i], {}).get('产品名称', '')
             for i in range(len(skus))
         ]
@@ -113,20 +139,20 @@ def load_and_normalize_data(vdf_file, df_file, exclude_cancelled=True):
 
     combined = pd.concat(frames, ignore_index=True)
     combined = combined.dropna(subset=['Date'])
-    combined = combined[combined['SKU'] != 'nan']
+    combined = combined[(combined['SKU'] != '') & (~combined['SKU'].str.lower().isin(['nan', 'none', 'null']))]
     combined['Month'] = combined['Date'].dt.month
     return combined
 
 def generate_demo_data():
-    """生成单品 SKU 级别演示数据"""
+    """生成演示数据（VDF 为 产品SKU，DF 为 发货产品）"""
     np.random.seed(42)
     dates = pd.date_range('2026-01-01', '2026-12-31', freq='D')
     skus = [
         ('PD160B', 'Waykar 34 Pint 除湿机', 'Waykar', '除湿机', '主力爆款', 'VDF', 135.0, 'Kristen'),
-        ('PD250B', 'Waykar 40 Pint 除湿机', 'Waykar', '除湿机', '利润款', 'DF', 168.0, 'Kristen'),
+        ('PD250B-SHIP', 'Waykar 40 Pint 除湿机(发货SKU)', 'Waykar', '除湿机', '利润款', 'DF', 168.0, 'Kristen'),
         ('PD250B', 'Waykar 40 Pint 除湿机', 'Waykar', '除湿机', '利润款', 'VDF', 165.0, 'Kristen'),
         ('KS-AC10', 'Kesnos 10000 BTU 移动空调', 'Kesnos', '移动空调', '季节款', 'VDF', 210.0, 'Zoey'),
-        ('SR-MT12', 'Serweet 12寸混合床垫 Queen', 'Serweet', '床垫', '常青款', 'DF', 185.0, '陈菊'),
+        ('SR-MT12-SHIP', 'Serweet 12寸混合床垫 Queen(发货SKU)', 'Serweet', '床垫', '常青款', 'DF', 185.0, '陈菊'),
         ('YF-DH50', 'Yaufey 商业除湿机 120 Pint', 'Yaufey', '商业除湿机', 'Pro工程款', 'VDF', 420.0, 'Kristen'),
     ]
     rows = []
@@ -153,9 +179,10 @@ def generate_demo_data():
 # ---------------------------------------------------------
 with st.sidebar:
     st.header("📂 1. 2026 历史数据导入")
-    vdf_uploaded = st.file_uploader("上传 2026 VDF 销售表 (xlsx/csv)", type=['xlsx', 'xls', 'csv'])
-    df_uploaded = st.file_uploader("上传 2026 DF 销售表 (xlsx/csv)", type=['xlsx', 'xls', 'csv'])
+    vdf_uploaded = st.file_uploader("上传 2026 VDF 销售表 (按 产品SKU)", type=['xlsx', 'xls', 'csv'])
+    df_uploaded = st.file_uploader("上传 2026 DF 销售表 (按 发货产品)", type=['xlsx', 'xls', 'csv'])
     exclude_cancel = st.checkbox("VDF 自动剔除 Cancelled 订单", value=True)
+    st.caption("口径说明：VDF 取 `产品SKU`，DF 取 `发货产品`。")
 
     st.divider()
     st.header("⚙️ 2. 全局初始化基线 (用于快速生成初稿)")
@@ -174,10 +201,10 @@ if vdf_uploaded or df_uploaded:
     st.sidebar.success(f"已加载 {len(df_2026):,} 条有效订单，共 {df_2026['SKU'].nunique()} 个独立 SKU")
 else:
     df_2026 = generate_demo_data()
-    st.info("💡 当前处于**演示模式**。请在左侧上传 2026 年 VDF 与 DF 销售表，即可按单个 SKU 的 1-12 月实际销量进行自定义预估。")
+    st.info("💡 当前处于**演示模式**。请在左侧上传 2026 年 VDF（产品SKU）与 DF（发货产品）销售表，即可按单品月度销量进行自定义预估。")
 
 if df_2026.empty:
-    st.error("未能解析到有效数据，请检查上传文件表头。")
+    st.error("未能解析到有效数据，请检查上传文件表头（VDF需含 产品SKU，DF需含 发货产品）。")
     st.stop()
 
 # ---------------------------------------------------------
@@ -195,7 +222,7 @@ with f3:
 with f4:
     sel_owner = st.multiselect("运营 (Owner)", df_2026['Owner'].unique(), default=list(df_2026['Owner'].unique()))
 with f5:
-    sku_keyword = st.text_input("🔎 搜索特定 SKU 或产品名称", placeholder="输入 SKU 编码过滤，如 PD160B...")
+    sku_keyword = st.text_input("🔎 搜索 SKU（VDF产品SKU / DF发货产品）或品名", placeholder="输入 SKU 编码过滤...")
 
 filtered_2026 = df_2026[
     (df_2026['Channel'].isin(sel_ch)) &
@@ -216,7 +243,6 @@ if sku_keyword.strip():
 # ---------------------------------------------------------
 sku_keys = ['Channel', 'SKU', 'Brand', 'Category', 'Owner']
 
-# 1) 汇总每个 SKU 的 2026 全年销量、销售额与均价
 sku_base = filtered_2026.groupby(sku_keys, as_index=False).agg(
     Product_Name=('Product_Name', 'first'),
     Positioning=('Positioning', 'first'),
@@ -225,7 +251,6 @@ sku_base = filtered_2026.groupby(sku_keys, as_index=False).agg(
 )
 sku_base['ASP_2026'] = np.where(sku_base['Qty_2026'] > 0, (sku_base['Sales_2026'] / sku_base['Qty_2026']).round(2), 0.0)
 
-# 2) 透视每个 SKU 在 2026 年 1-12 月的实际销量
 pivot_26 = filtered_2026.pivot_table(
     index=sku_keys, columns='Month', values='Qty', aggfunc='sum', fill_value=0
 )
@@ -236,10 +261,8 @@ pivot_26 = pivot_26[list(range(1, 13))]
 pivot_26.columns = MONTH_COLS_26
 pivot_26 = pivot_26.reset_index()
 
-# 合并基础信息与 2026 月度销量
 master_df = sku_base.merge(pivot_26, on=sku_keys, how='left')
 
-# 3) 生成 2027 初始预估列（可被用户逐单元格覆盖）
 master_df['2027_预期供货价($)'] = (master_df['ASP_2026'] * (1 + init_price_adj / 100.0)).round(2)
 
 for m in range(1, 13):
@@ -252,11 +275,11 @@ for m in range(1, 13):
 # ---------------------------------------------------------
 st.subheader("📝 第一步：单品 SKU 2027 年 1–12 月销量自定义编辑表")
 st.markdown("""
-- **直接修改月度销量**：双击任意 SKU 的 **`27_1月` ~ `27_12月`** 单元格输入你的目标台数（支持从 Excel 复制一列/一行直接粘贴）。
-- **新增 2027 新品 SKU**：拉到表格最底部点击 **`+`** 行，手动填写 `Channel`、`SKU`、`Brand`、`Category`、`2027_预期供货价($)` 及各月预估销量即可。
+- **SKU 口径说明**：`VDF` 对应表内 **`产品SKU`**，`DF` 对应表内 **`发货产品`**。
+- **直接修改月度销量**：双击任意 SKU 的 **`27_1月` ~ `27_12月`** 单元格输入目标台数（支持从 Excel 复制粘贴）。
+- **新增 2027 新品 SKU**：拉到表格最底部点击 **`+`** 行，填写 `Channel`、`SKU`、`Brand`、`Category`、`2027_预期供货价($)` 及各月预估销量即可。
 """)
 
-# 决定编辑表展示哪些列
 display_cols = ['Channel', 'SKU', 'Brand', 'Category', 'Owner', 'ASP_2026', '2027_预期供货价($)', 'Qty_2026']
 if show_2026_months:
     display_cols += MONTH_COLS_26
@@ -264,7 +287,7 @@ display_cols += MONTH_COLS_27
 
 col_cfg = {
     "Channel": st.column_config.SelectboxColumn("渠道", options=["VDF", "DF"], required=True, width="small"),
-    "SKU": st.column_config.TextColumn("产品SKU", required=True, width="medium"),
+    "SKU": st.column_config.TextColumn("SKU (VDF产品/DF发货)", required=True, width="medium"),
     "Brand": st.column_config.TextColumn("品牌", width="small"),
     "Category": st.column_config.TextColumn("产品属性", width="small"),
     "Owner": st.column_config.TextColumn("运营", width="small"),
@@ -289,13 +312,11 @@ edited_sku_df = st.data_editor(
 # ---------------------------------------------------------
 # 7. 实时重算单品与全局 2027 汇总指标
 # ---------------------------------------------------------
-# 填充新增行可能产生的空值
 for c27 in MONTH_COLS_27:
     edited_sku_df[c27] = pd.to_numeric(edited_sku_df[c27], errors='coerce').fillna(0).astype(int)
 edited_sku_df['2027_预期供货价($)'] = pd.to_numeric(edited_sku_df['2027_预期供货价($)'], errors='coerce').fillna(0.0)
 edited_sku_df['Qty_2026'] = pd.to_numeric(edited_sku_df['Qty_2026'], errors='coerce').fillna(0).astype(int)
 
-# 合并回 2026 历史数据（处理用户未开启 show_2026_months 时的 2026 月度数据关联）
 calc_df = edited_sku_df.copy()
 if not show_2026_months:
     calc_df = calc_df.merge(
@@ -314,7 +335,6 @@ else:
     )
     calc_df['Sales_2026'] = calc_df['Sales_2026'].fillna(0.0)
 
-# 计算单品 2027 全年总销量与总销售额
 calc_df['Qty_2027'] = calc_df[MONTH_COLS_27].sum(axis=1)
 calc_df['Sales_2027'] = calc_df['Qty_2027'] * calc_df['2027_预期供货价($)']
 calc_df['销量同比(%)'] = np.where(
@@ -323,12 +343,10 @@ calc_df['销量同比(%)'] = np.where(
     np.nan
 )
 
-# 计算每个 SKU 2027 每月预估销售额
 SALES_COLS_27 = [f"27_{m}月_供货额($)" for m in range(1, 13)]
 for m in range(1, 13):
     calc_df[f"27_{m}月_供货额($)"] = calc_df[f"27_{m}月"] * calc_df['2027_预期供货价($)']
 
-# KPI 看板
 tot_q26 = calc_df['Qty_2026'].sum()
 tot_q27 = calc_df['Qty_2027'].sum()
 q_yoy = ((tot_q27 - tot_q26) / tot_q26 * 100) if tot_q26 > 0 else 0
@@ -359,7 +377,6 @@ tab1, tab2, tab3 = st.tabs([
 ])
 
 with tab1:
-    # 汇总 1-12 月销量与销售额
     m_labels = [f"{m}月" for m in range(1, 13)]
     q26_monthly = [calc_df[f"26_{m}月"].sum() for m in range(1, 13)]
     q27_monthly = [calc_df[f"27_{m}月"].sum() for m in range(1, 13)]
@@ -413,15 +430,11 @@ with tab3:
         use_container_width=True
     )
 
-    # 导出多 Sheet Excel
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # Sheet 1: 单品年度总览
         calc_df[summary_view_cols].to_excel(writer, sheet_name='1_单品SKU年度预估总览', index=False)
-        # Sheet 2: 单品2026 vs 2027月度销量明细
         qty_detail_cols = ['Channel', 'SKU', 'Brand', 'Category', 'Owner', 'Qty_2026', 'Qty_2027'] + MONTH_COLS_26 + MONTH_COLS_27
         calc_df[qty_detail_cols].to_excel(writer, sheet_name='2_单品月度销量明细(台)', index=False)
-        # Sheet 3: 单品2027月度供货额明细
         sales_detail_cols = ['Channel', 'SKU', 'Brand', 'Category', 'Owner', '2027_预期供货价($)', 'Sales_2027'] + SALES_COLS_27
         calc_df[sales_detail_cols].to_excel(writer, sheet_name='3_单品2027月度供货额($)', index=False)
 
