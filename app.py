@@ -406,7 +406,8 @@ with st.expander("📂 展开查看 2026 分渠道销售数据明细（月度趋
             st.dataframe(
                 show_26_tbl[view_26_cols].style.format({
                     'Qty_2026': '{:,.0f}',
-                    'Sales_2026': '${:,.2f}', 'ASP_2026': '${:,.2f}',
+                    'Sales_2026': '${:,.2f}',
+                    'ASP_2026': '${:,.2f}',
                     **{c: '{:,.0f}' for c in MONTH_COLS_26}
                 }),
                 use_container_width=True,
@@ -438,7 +439,8 @@ with st.expander("📂 展开查看 2026 分渠道销售数据明细（月度趋
             .style.format({
                 'Date': lambda d: d.strftime('%Y-%m-%d') if pd.notna(d) else '',
                 'Qty': '{:,.0f}',
-                'Unit_Price': '${:,.2f}', 'Sales': '${:,.2f}'
+                'Unit_Price': '${:,.2f}',
+                'Sales': '${:,.2f}'
             }),
             use_container_width=True,
             height=300
@@ -598,4 +600,69 @@ with f_tab1:
         fig_27s.add_trace(go.Bar(x=m_labels, y=vs27_m, name='VDF 2027预估供货额($)', marker_color='#1d4ed8'))
         fig_27s.add_trace(go.Bar(x=m_labels, y=ds27_m, name='DF 2027预估供货额($)', marker_color='#ea580c'))
         fig_27s.update_layout(barmode='group', title="2027 VDF vs DF 月度预估供货销售额 ($)", hovermode="x unified", height=380)
-        st.plotly_chart(fig_27s, use_container_width
+        st.plotly_chart(fig_27s, use_container_width=True)
+
+with f_tab2:
+    r_col1, r_col2 = st.columns(2)
+    with r_col1:
+        top_vdf = vdf_27_rows.sort_values('Sales_2027', ascending=False).head(10)
+        fig_tv = px.bar(top_vdf, x='SKU', y=['Sales_2026', 'Sales_2027'], barmode='group', title="VDF Top 10 唯一 SKU：2026 vs 2027 供货额 ($)")
+        st.plotly_chart(fig_tv, use_container_width=True)
+    with r_col2:
+        top_df = df_27_rows.sort_values('Sales_2027', ascending=False).head(10)
+        fig_td = px.bar(top_df, x='SKU', y=['Sales_2026', 'Sales_2027'], barmode='group', title="DF Top 10 唯一 SKU：2026 vs 2027 供货额 ($)")
+        st.plotly_chart(fig_td, use_container_width=True)
+
+with f_tab3:
+    sum_cols = [
+        'Channel', 'SKU', 'Brand', 'Category', 'Owner',
+        'Qty_2026', 'Qty_2027', '销量同比(%)',
+        'ASP_2026', '2027_预期供货价($)', 'Sales_2026', 'Sales_2027', '销售额同比(%)'
+    ]
+
+    st.markdown("**VDF 2027 预估明细（产品SKU 唯一）**")
+    st.dataframe(
+        vdf_27_rows[sum_cols].sort_values('Sales_2027', ascending=False).style.format({
+            'Qty_2026': '{:,.0f}', 'Qty_2027': '{:,.0f}', '销量同比(%)': '{:+.1f}%',
+            'ASP_2026': '${:,.2f}', '2027_预期供货价($)': '${:,.2f}',
+            'Sales_2026': '${:,.2f}', 'Sales_2027': '${:,.2f}', '销售额同比(%)': '{:+.1f}%'
+        }, na_rep="新品"),
+        use_container_width=True, height=260
+    )
+
+    st.markdown("**DF 2027 预估明细（发货产品 唯一）**")
+    st.dataframe(
+        df_27_rows[sum_cols].sort_values('Sales_2027', ascending=False).style.format({
+            'Qty_2026': '{:,.0f}', 'Qty_2027': '{:,.0f}', '销量同比(%)': '{:+.1f}%',
+            'ASP_2026': '${:,.2f}', '2027_预期供货价($)': '${:,.2f}',
+            'Sales_2026': '${:,.2f}', 'Sales_2027': '${:,.2f}', '销售额同比(%)': '{:+.1f}%'
+        }, na_rep="新品"),
+        use_container_width=True, height=260
+    )
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        if not vdf_27_rows.empty:
+            vdf_27_rows[sum_cols].to_excel(writer, sheet_name='1_VDF_2027年度汇总', index=False)
+            vdf_27_rows[['SKU', 'Brand', 'Category', 'Owner', 'Qty_2026', 'Qty_2027'] + MONTH_COLS_26 + MONTH_COLS_27].to_excel(
+                writer, sheet_name='2_VDF_2027月度销量(台)', index=False
+            )
+            vdf_27_rows[['SKU', 'Brand', 'Category', 'Owner', '2027_预期供货价($)', 'Sales_2027'] + SALES_COLS_27].to_excel(
+                writer, sheet_name='3_VDF_2027月度供货额($)', index=False
+            )
+        if not df_27_rows.empty:
+            df_27_rows[sum_cols].to_excel(writer, sheet_name='4_DF_2027年度汇总', index=False)
+            df_27_rows[['SKU', 'Brand', 'Category', 'Owner', 'Qty_2026', 'Qty_2027'] + MONTH_COLS_26 + MONTH_COLS_27].to_excel(
+                writer, sheet_name='5_DF_2027月度销量(台)', index=False
+            )
+            df_27_rows[['SKU', 'Brand', 'Category', 'Owner', '2027_预期供货价($)', 'Sales_2027'] + SALES_COLS_27].to_excel(
+                writer, sheet_name='6_DF_2027月度供货额($)', index=False
+            )
+
+    st.download_button(
+        label="📥 导出 2027 VDF + DF 分渠道唯一 SKU 完整报表 (Excel)",
+        data=output.getvalue(),
+        file_name="2027_HD_VDF_DF_Forecast.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary"
+    )
