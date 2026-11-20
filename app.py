@@ -9,7 +9,7 @@ from io import BytesIO
 # 1. 页面基础配置
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="2027 HD 单品SKU月度销量与销售额预估工作台",
+    page_title="2027 HD 唯一SKU月度销量与销售额预估工作台",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -145,20 +145,20 @@ def load_and_normalize_data(vdf_file, df_file, exclude_cancelled=True):
     return combined
 
 def generate_demo_data():
-    """生成演示数据（VDF 为 产品SKU，DF 为 发货产品）"""
+    """生成演示数据（含跨 VDF/DF 同一 SKU 以及单一渠道 SKU，用于验证唯一 SKU 合并）"""
     np.random.seed(42)
     dates = pd.date_range('2026-01-01', '2026-12-31', freq='D')
-    skus = [
+    records_cfg = [
         ('PD160B', 'Waykar 34 Pint 除湿机', 'Waykar', '除湿机', '主力爆款', 'VDF', 135.0, 'Kristen'),
+        ('PD160B', 'Waykar 34 Pint 除湿机', 'Waykar', '除湿机', '主力爆款', 'DF', 138.0, 'Kristen'),
         ('PD250B-SHIP', 'Waykar 40 Pint 除湿机(发货SKU)', 'Waykar', '除湿机', '利润款', 'DF', 168.0, 'Kristen'),
-        ('PD250B', 'Waykar 40 Pint 除湿机', 'Waykar', '除湿机', '利润款', 'VDF', 165.0, 'Kristen'),
         ('KS-AC10', 'Kesnos 10000 BTU 移动空调', 'Kesnos', '移动空调', '季节款', 'VDF', 210.0, 'Zoey'),
         ('SR-MT12-SHIP', 'Serweet 12寸混合床垫 Queen(发货SKU)', 'Serweet', '床垫', '常青款', 'DF', 185.0, '陈菊'),
         ('YF-DH50', 'Yaufey 商业除湿机 120 Pint', 'Yaufey', '商业除湿机', 'Pro工程款', 'VDF', 420.0, 'Kristen'),
     ]
     rows = []
     for d in dates:
-        for sku, name, brand, cat, pos, ch, price, owner in skus:
+        for sku, name, brand, cat, pos, ch, price, owner in records_cfg:
             if cat in ['除湿机', '商业除湿机']:
                 season_factor = 1.8 if d.month in [5, 6, 7, 8] else (0.6 if d.month in [1, 2, 12] else 1.0)
             elif cat == '移动空调':
@@ -175,6 +175,68 @@ def generate_demo_data():
                 })
     return pd.DataFrame(rows)
 
+def build_unique_sku_table(df_filtered):
+    """按【唯一 SKU】汇总 2026 销量、供货额、均价、涉及渠道与 1-12 月销量"""
+    if df_filtered.empty:
+        return pd.DataFrame()
+
+    # 汇总每个唯一 SKU 的渠道组合、品牌、属性、运营、总量与总额
+    def join_unique(series):
+        vals = sorted({str(v).strip() for v in series.dropna() if str(v).strip() != ''})
+        return " + ".join(vals) if vals else "未标注"
+
+    def first_non_empty(series):
+        for v in series:
+            if pd.notna(v) and str(v).strip() != '':
+                return str(v).strip()
+        return ''
+
+    # 分别统计 VDF 与 DF 均价作参考
+    vdf_sub = df_filtered[df_filtered['Channel'] == 'VDF'].groupby('SKU', as_index=False).agg(
+        VDF_Qty=('Qty', 'sum'), VDF_Sales=('Sales', 'sum')
+    )
+    vdf_sub['VDF_ASP'] = np.where(vdf_sub['VDF_Qty'] > 0, (vdf_sub['VDF_Sales'] / vdf_sub['VDF_Qty']).round(2), np.nan)
+
+    df_sub = df_filtered[df_filtered['Channel'] == 'DF'].groupby('SKU', as_index=False).agg(
+        DF_Qty=('Qty', 'sum'), DF_Sales=('Sales', 'sum')
+    )
+    df_sub['DF_ASP'] = np.where(df_sub['DF_Qty'] > 0, (df_sub['DF_Sales'] / df_sub['DF_Qty']).round(2), np.nan)
+
+    sku_agg = df_filtered.groupby('SKU', as_index=False).agg(
+        Channels=('Channel', join_unique),
+        Product_Name=('Product_Name', first_non_empty),
+        Brand=('Brand', first_non_empty),
+        Category=('Category', first_non_empty),
+        Positioning=('Positioning', first_non_empty),
+        Owner=('Owner', join_unique),
+        Qty_2026=('Qty', 'sum'),
+        Sales_2026=('Sales', 'sum')
+    )
+    sku_agg['ASP_2026'] = np.where(sku_agg['Qty_2026'] > 0, (sku_agg['Sales_2026'] / sku_agg['Qty_2026']).round(2), 0.0)
+    sku_agg = sku_agg.merge(vdf_sub[['SKU', 'VDF_ASP']], on='SKU', how='left').merge(df_sub[['SKU', 'DF_ASP']], on='SKU', how='left')
+
+    # 唯一 SKU 的 2026 1-12 月销量宽表
+    piv_qty = df_filtered.pivot_table(index='SKU', columns='Month', values='Qty', aggfunc='sum', fill_value=0)
+    for m in range(1, 13):
+        if m not in piv_qty.columns:
+            piv_qty[m] = 0
+    piv_qty = piv_qty[list(range(1, 13))]
+    piv_qty.columns = MONTH_COLS_26
+    piv_qty = piv_qty.reset_index()
+
+    # 唯一 SKU 的 2026 1-12 月供货额宽表
+    piv_sales = df_filtered.pivot_table(index='SKU', columns='Month', values='Sales', aggfunc='sum', fill_value=0)
+    for m in range(1, 13):
+        if m not in piv_sales.columns:
+            piv_sales[m] = 0
+    piv_sales = piv_sales[list(range(1, 13))]
+    piv_sales.columns = SALES_COLS_26
+    piv_sales = piv_sales.reset_index()
+
+    out = sku_agg.merge(piv_qty, on='SKU', how='left').merge(piv_sales, on='SKU', how='left')
+    out = out.drop_duplicates(subset=['SKU']).sort_values('Sales_2026', ascending=False).reset_index(drop=True)
+    return out
+
 # ---------------------------------------------------------
 # 3. 侧边栏：数据导入与全局初始化参数
 # ---------------------------------------------------------
@@ -183,12 +245,12 @@ with st.sidebar:
     vdf_uploaded = st.file_uploader("上传 2026 VDF 销售表 (按 产品SKU)", type=['xlsx', 'xls', 'csv'])
     df_uploaded = st.file_uploader("上传 2026 DF 销售表 (按 发货产品)", type=['xlsx', 'xls', 'csv'])
     exclude_cancel = st.checkbox("VDF 自动剔除 Cancelled 订单", value=True)
-    st.caption("口径说明：VDF 取 `产品SKU`，DF 取 `发货产品`。")
+    st.caption("规则：全表按 **产品SKU** 唯一合并（VDF取 `产品SKU`，DF取 `发货产品`）。")
 
     st.divider()
     st.header("⚙️ 2. 全局初始化基线 (用于快速生成初稿)")
     init_growth = st.slider("默认月度同比增速基线 (%)", -50, 200, 20, step=5,
-                            help="系统会先按此增速生成每个SKU 1-12月的初始预估值，随后你可在主表逐个SKU、逐个月份手动修改。")
+                            help="系统会先按此增速生成每个唯一 SKU 1-12月的初始预估值，随后可在主表逐 SKU、逐月手动修改。")
     init_price_adj = st.slider("默认供货价调整基线 (%)", -20, 30, 0, step=1)
     
     st.divider()
@@ -199,10 +261,10 @@ with st.sidebar:
 # 加载数据
 if vdf_uploaded or df_uploaded:
     df_2026 = load_and_normalize_data(vdf_uploaded, df_uploaded, exclude_cancel)
-    st.sidebar.success(f"已加载 {len(df_2026):,} 条有效订单，共 {df_2026['SKU'].nunique()} 个独立 SKU")
+    st.sidebar.success(f"已加载 {len(df_2026):,} 条有效订单，合并为 {df_2026['SKU'].nunique()} 个唯一 SKU")
 else:
     df_2026 = generate_demo_data()
-    st.info("💡 当前处于**演示模式**。请在左侧上传 2026 年 VDF（产品SKU）与 DF（发货产品）销售表，查看完整 2026 销售表现并进行 2027 预估。")
+    st.info("💡 当前处于**演示模式**。请在左侧上传 2026 年 VDF（产品SKU）与 DF（发货产品）销售表；全表严格按 **唯一产品SKU** 合并去重。")
 
 if df_2026.empty:
     st.error("未能解析到有效数据，请检查上传文件表头（VDF需含 产品SKU，DF需含 发货产品）。")
@@ -211,11 +273,11 @@ if df_2026.empty:
 # ---------------------------------------------------------
 # 4. 顶部多维筛选器
 # ---------------------------------------------------------
-st.title("🎯 2026 销售数据看板 & 2027 单品 SKU 月度预估工作台")
+st.title("🎯 2026 销售数据看板 & 2027 唯一 SKU 月度预估工作台")
 
 f1, f2, f3, f4, f5 = st.columns([1.2, 1.2, 1.2, 1.2, 1.8])
 with f1:
-    sel_ch = st.multiselect("渠道 (Channel)", df_2026['Channel'].unique(), default=list(df_2026['Channel'].unique()))
+    sel_ch = st.multiselect("筛选包含渠道", df_2026['Channel'].unique(), default=list(df_2026['Channel'].unique()))
 with f2:
     sel_brand = st.multiselect("品牌 (Brand)", df_2026['Brand'].unique(), default=list(df_2026['Brand'].unique()))
 with f3:
@@ -223,7 +285,7 @@ with f3:
 with f4:
     sel_owner = st.multiselect("运营 (Owner)", df_2026['Owner'].unique(), default=list(df_2026['Owner'].unique()))
 with f5:
-    sku_keyword = st.text_input("🔎 搜索 SKU（VDF产品SKU / DF发货产品）或品名", placeholder="输入 SKU 编码过滤...")
+    sku_keyword = st.text_input("🔎 搜索唯一 SKU 或品名", placeholder="输入 SKU 编码过滤...")
 
 filtered_2026 = df_2026[
     (df_2026['Channel'].isin(sel_ch)) &
@@ -239,29 +301,31 @@ if sku_keyword.strip():
         filtered_2026['Product_Name'].str.lower().str.contains(kw)
     ]
 
-# ---------------------------------------------------------
-# 5. 2026 年历史销售数据完整展示区
-# ---------------------------------------------------------
-st.subheader("🕰️ 2026 年实际销售数据总览")
+unique_2026_df = build_unique_sku_table(filtered_2026)
 
-h_qty_26 = filtered_2026['Qty'].sum()
-h_sales_26 = filtered_2026['Sales'].sum()
+# ---------------------------------------------------------
+# 5. 2026 年历史销售数据展示区（按唯一 SKU 汇总）
+# ---------------------------------------------------------
+st.subheader("🕰️ 2026 年实际销售数据总览（按唯一产品SKU汇总）")
+
+h_qty_26 = unique_2026_df['Qty_2026'].sum() if not unique_2026_df.empty else 0
+h_sales_26 = unique_2026_df['Sales_2026'].sum() if not unique_2026_df.empty else 0
 h_asp_26 = h_sales_26 / h_qty_26 if h_qty_26 > 0 else 0.0
-h_sku_cnt_26 = filtered_2026['SKU'].nunique()
+h_sku_cnt_26 = unique_2026_df['SKU'].nunique() if not unique_2026_df.empty else 0
 
 vdf_sales_26 = filtered_2026[filtered_2026['Channel'] == 'VDF']['Sales'].sum()
 df_sales_26 = filtered_2026[filtered_2026['Channel'] == 'DF']['Sales'].sum()
 
 h1, h2, h3, h4 = st.columns(4)
-h1.metric("2026 实际总销量 (Units)", f"{h_qty_26:,.0f}", f"有效订单 {len(filtered_2026):,} 行")
+h1.metric("2026 实际总销量 (Units)", f"{h_qty_26:,.0f}", f"原始有效订单 {len(filtered_2026):,} 行")
 h2.metric("2026 实际总供货额 ($)", f"${h_sales_26:,.2f}", f"VDF ${vdf_sales_26:,.0f} | DF ${df_sales_26:,.0f}")
-h3.metric("2026 综合供货均价 (ASP)", f"${h_asp_26:,.2f}", "供货额 / 总销量")
-h4.metric("2026 动销 SKU 数量", f"{h_sku_cnt_26} 个", "VDF按产品SKU / DF按发货产品")
+h3.metric("2026 综合供货均价 (ASP)", f"${h_asp_26:,.2f}", "总供货额 / 总销量")
+h4.metric("2026 唯一动销 SKU 数", f"{h_sku_cnt_26} 个", "严格去重唯一值")
 
-with st.expander("📂 展开查看 2026 年销售数据明细（月度趋势 · 单品SKU月销宽表 · 清洗后底表）", expanded=True):
+with st.expander("📂 展开查看 2026 年销售数据明细（月度趋势 · 唯一SKU月销宽表 · 清洗后底表）", expanded=True):
     sub_t1, sub_t2, sub_t3 = st.tabs([
         "📈 2026 月度销量与供货额趋势",
-        "📦 2026 单品 SKU 1-12月销量与销售额明细",
+        "📦 2026 唯一 SKU 1-12月销量与销售额明细",
         "🧾 2026 清洗后销售记录明细"
     ])
 
@@ -282,64 +346,41 @@ with st.expander("📂 展开查看 2026 年销售数据明细（月度趋势 ·
         with c26_2:
             fig_26_s = px.bar(
                 m26_trend, x='Month_Label', y='Sales_26', color='Channel', barmode='stack',
-                title="2026 分月供货销售额分布 ($)", labels={'Month_Label': '月份', 'Sales_26': '供货销售额 ($)'}
+                title="2026 分月供货销售额分布 ($)", labels={'Month_Label': '月份', 'Sales_2026': '供货销售额 ($)'}
             )
             st.plotly_chart(fig_26_s, use_container_width=True)
 
     with sub_t2:
-        sku_keys = ['Channel', 'SKU', 'Brand', 'Category', 'Owner']
-        sku_26_sum = filtered_2026.groupby(sku_keys, as_index=False).agg(
-            Product_Name=('Product_Name', 'first'),
-            Positioning=('Positioning', 'first'),
-            Qty_2026=('Qty', 'sum'),
-            Sales_2026=('Sales', 'sum')
-        )
-        sku_26_sum['ASP_2026'] = np.where(sku_26_sum['Qty_2026'] > 0, (sku_26_sum['Sales_2026'] / sku_26_sum['Qty_2026']).round(2), 0.0)
+        view_26_cols = [
+            'SKU', 'Channels', 'Product_Name', 'Brand', 'Category', 'Owner',
+            'Qty_2026', 'Sales_2026', 'ASP_2026', 'VDF_ASP', 'DF_ASP'
+        ] + MONTH_COLS_26
 
-        piv_26_qty = filtered_2026.pivot_table(index=sku_keys, columns='Month', values='Qty', aggfunc='sum', fill_value=0)
-        for m in range(1, 13):
-            if m not in piv_26_qty.columns:
-                piv_26_qty[m] = 0
-        piv_26_qty = piv_26_qty[list(range(1, 13))]
-        piv_26_qty.columns = MONTH_COLS_26
-        piv_26_qty = piv_26_qty.reset_index()
-
-        piv_26_sales = filtered_2026.pivot_table(index=sku_keys, columns='Month', values='Sales', aggfunc='sum', fill_value=0)
-        for m in range(1, 13):
-            if m not in piv_26_sales.columns:
-                piv_26_sales[m] = 0
-        piv_26_sales = piv_26_sales[list(range(1, 13))]
-        piv_26_sales.columns = SALES_COLS_26
-        piv_26_sales = piv_26_sales.reset_index()
-
-        detail_26_table = sku_26_sum.merge(piv_26_qty, on=sku_keys, how='left').merge(piv_26_sales, on=sku_keys, how='left')
-        detail_26_table = detail_26_table.sort_values('Sales_2026', ascending=False)
-
-        view_26_cols = ['Channel', 'SKU', 'Product_Name', 'Brand', 'Category', 'Owner', 'Qty_2026', 'Sales_2026', 'ASP_2026'] + MONTH_COLS_26
         st.dataframe(
-            detail_26_table[view_26_cols].style.format({
+            unique_2026_df[view_26_cols].style.format({
                 'Qty_2026': '{:,.0f}',
                 'Sales_2026': '${:,.2f}',
                 'ASP_2026': '${:,.2f}',
+                'VDF_ASP': '${:,.2f}',
+                'DF_ASP': '${:,.2f}',
                 **{c: '{:,.0f}' for c in MONTH_COLS_26}
-            }),
+            }, na_rep="-"),
             use_container_width=True,
             height=350
         )
 
-        # 导出 2026 销售数据明细
         buf_26 = BytesIO()
         with pd.ExcelWriter(buf_26, engine='openpyxl') as writer:
-            detail_26_table[view_26_cols].to_excel(writer, sheet_name='2026_SKU月度销量', index=False)
-            detail_26_table[['Channel', 'SKU', 'Product_Name', 'Brand', 'Category', 'Owner', 'Sales_2026'] + SALES_COLS_26].to_excel(
-                writer, sheet_name='2026_SKU月度供货额($)', index=False
+            unique_2026_df[view_26_cols].to_excel(writer, sheet_name='2026_唯一SKU月度销量', index=False)
+            unique_2026_df[['SKU', 'Channels', 'Product_Name', 'Brand', 'Category', 'Owner', 'Sales_2026'] + SALES_COLS_26].to_excel(
+                writer, sheet_name='2026_唯一SKU月度供货额($)', index=False
             )
             filtered_2026.to_excel(writer, sheet_name='2026_清洗后订单明细', index=False)
 
         st.download_button(
-            label="📥 导出 2026 完整销售数据明细 (Excel)",
+            label="📥 导出 2026 唯一 SKU 完整销售数据 (Excel)",
             data=buf_26.getvalue(),
-            file_name="2026_HD_Actual_Sales_Data.xlsx",
+            file_name="2026_HD_Unique_SKU_Sales_Data.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
@@ -357,32 +398,12 @@ with st.expander("📂 展开查看 2026 年销售数据明细（月度趋势 ·
             use_container_width=True,
             height=320
         )
-        st.caption("注：为保证网页流畅度，底表预览默认展示最新 500 条筛选记录；完整记录可通过上方按钮导出 Excel。")
+        st.caption("注：底表预览默认展示最新 500 条筛选记录；完整记录可通过上方按钮导出 Excel。")
 
 # ---------------------------------------------------------
-# 6. 构建【单品 SKU × 1-12月】基准宽表（2027 预估）
+# 6. 构建【唯一 SKU × 1-12月】2027 预估基准宽表
 # ---------------------------------------------------------
-sku_keys = ['Channel', 'SKU', 'Brand', 'Category', 'Owner']
-
-sku_base = filtered_2026.groupby(sku_keys, as_index=False).agg(
-    Product_Name=('Product_Name', 'first'),
-    Positioning=('Positioning', 'first'),
-    Qty_2026=('Qty', 'sum'),
-    Sales_2026=('Sales', 'sum')
-)
-sku_base['ASP_2026'] = np.where(sku_base['Qty_2026'] > 0, (sku_base['Sales_2026'] / sku_base['Qty_2026']).round(2), 0.0)
-
-pivot_26 = filtered_2026.pivot_table(
-    index=sku_keys, columns='Month', values='Qty', aggfunc='sum', fill_value=0
-)
-for m in range(1, 13):
-    if m not in pivot_26.columns:
-        pivot_26[m] = 0
-pivot_26 = pivot_26[list(range(1, 13))]
-pivot_26.columns = MONTH_COLS_26
-pivot_26 = pivot_26.reset_index()
-
-master_df = sku_base.merge(pivot_26, on=sku_keys, how='left')
+master_df = unique_2026_df.copy()
 master_df['2027_预期供货价($)'] = (master_df['ASP_2026'] * (1 + init_price_adj / 100.0)).round(2)
 
 for m in range(1, 13):
@@ -391,28 +412,33 @@ for m in range(1, 13):
     master_df[col_27] = np.round(master_df[col_26] * (1 + init_growth / 100.0)).astype(int)
 
 # ---------------------------------------------------------
-# 7. 交互式单品 SKU 月度预估编辑区
+# 7. 交互式【唯一 SKU】月度预估编辑区
 # ---------------------------------------------------------
 st.divider()
-st.subheader("📝 第一步：单品 SKU 2027 年 1–12 月销量自定义编辑表")
+st.subheader("📝 第一步：唯一产品 SKU 的 2027 年 1–12 月销量自定义编辑表")
 st.markdown("""
-- **SKU 口径说明**：`VDF` 对应表内 **`产品SKU`**，`DF` 对应表内 **`发货产品`**。
-- **直接修改月度销量**：双击任意 SKU 的 **`27_1月` ~ `27_12月`** 单元格输入目标台数（支持从 Excel 复制粘贴）。
-- **新增 2027 新品 SKU**：拉到表格最底部点击 **`+`** 行，填写 `Channel`、`SKU`、`Brand`、`Category`、`2027_预期供货价($)` 及各月预估销量即可。
+- **唯一 SKU 规则**：每个 `产品SKU`（VDF取 `产品SKU`，DF取 `发货产品`）在表中**仅占唯一一行**；若同时在 VDF 和 DF 有销量，已自动合并汇总为单行月度销量。
+- **直接修改月度销量**：双击任意 SKU 的 **`27_1月` ~ `27_12月`** 单元格输入目标台数（支持 Excel 复制粘贴）。
+- **新增 2027 新品 SKU**：拉到表格最底部点击 **`+`** 行，填写**不重复的 `SKU`**、`Brand`、`Category`、`2027_预期供货价($)` 及各月预估销量即可。
 """)
 
-display_cols = ['Channel', 'SKU', 'Brand', 'Category', 'Owner', 'ASP_2026', '2027_预期供货价($)', 'Qty_2026']
+display_cols = [
+    'SKU', 'Channels', 'Brand', 'Category', 'Owner',
+    'ASP_2026', 'VDF_ASP', 'DF_ASP', '2027_预期供货价($)', 'Qty_2026'
+]
 if show_2026_months:
     display_cols += MONTH_COLS_26
 display_cols += MONTH_COLS_27
 
 col_cfg = {
-    "Channel": st.column_config.SelectboxColumn("渠道", options=["VDF", "DF"], required=True, width="small"),
-    "SKU": st.column_config.TextColumn("SKU (VDF产品/DF发货)", required=True, width="medium"),
+    "SKU": st.column_config.TextColumn("唯一产品SKU", required=True, width="medium"),
+    "Channels": st.column_config.TextColumn("历史渠道", width="small", disabled=True),
     "Brand": st.column_config.TextColumn("品牌", width="small"),
     "Category": st.column_config.TextColumn("产品属性", width="small"),
     "Owner": st.column_config.TextColumn("运营", width="small"),
-    "ASP_2026": st.column_config.NumberColumn("26均价($)", format="$%.2f", disabled=True),
+    "ASP_2026": st.column_config.NumberColumn("26综合均价($)", format="$%.2f", disabled=True),
+    "VDF_ASP": st.column_config.NumberColumn("26 VDF均价($)", format="$%.2f", disabled=True),
+    "DF_ASP": st.column_config.NumberColumn("26 DF均价($)", format="$%.2f", disabled=True),
     "2027_预期供货价($)": st.column_config.NumberColumn("27预期供货价($)", min_value=0.0, step=1.0, format="$%.2f"),
     "Qty_2026": st.column_config.NumberColumn("26总销量", format="%d", disabled=True),
 }
@@ -427,34 +453,46 @@ edited_sku_df = st.data_editor(
     use_container_width=True,
     height=460,
     num_rows="dynamic",
-    key="sku_monthly_editor"
+    key="unique_sku_monthly_editor"
 )
 
 # ---------------------------------------------------------
-# 8. 实时重算单品与全局 2027 汇总指标
+# 8. 强制保证 SKU 唯一性并实时重算 2027 指标
 # ---------------------------------------------------------
+edited_sku_df['SKU'] = edited_sku_df['SKU'].astype(str).str.strip()
+edited_sku_df = edited_sku_df[(edited_sku_df['SKU'] != '') & (~edited_sku_df['SKU'].str.lower().isin(['nan', 'none', 'null']))].copy()
+
 for c27 in MONTH_COLS_27:
     edited_sku_df[c27] = pd.to_numeric(edited_sku_df[c27], errors='coerce').fillna(0).astype(int)
 edited_sku_df['2027_预期供货价($)'] = pd.to_numeric(edited_sku_df['2027_预期供货价($)'], errors='coerce').fillna(0.0)
 edited_sku_df['Qty_2026'] = pd.to_numeric(edited_sku_df['Qty_2026'], errors='coerce').fillna(0).astype(int)
 
-calc_df = edited_sku_df.copy()
-if not show_2026_months:
-    calc_df = calc_df.merge(
-        master_df[['Channel', 'SKU', 'Sales_2026'] + MONTH_COLS_26],
-        on=['Channel', 'SKU'],
-        how='left'
-    )
-    calc_df['Sales_2026'] = calc_df['Sales_2026'].fillna(0.0)
+# 若用户在新增行或编辑时输入了重复 SKU，自动按唯一 SKU 聚合合并，确保下游 SKU 严格唯一
+dup_count = len(edited_sku_df) - edited_sku_df['SKU'].nunique()
+if dup_count > 0:
+    st.warning(f"⚠️ 检测到 {dup_count} 条重复产品 SKU 记录，系统已自动按【唯一产品SKU】合并汇总月度销量与定价。")
+    agg_dict = {
+        'Channels': 'first',
+        'Brand': 'first',
+        'Category': 'first',
+        'Owner': 'first',
+        'ASP_2026': 'first',
+        '2027_预期供货价($)': 'mean',
+        'Qty_2026': 'sum'
+    }
     for c26 in MONTH_COLS_26:
-        calc_df[c26] = calc_df[c26].fillna(0).astype(int)
-else:
-    calc_df = calc_df.merge(
-        master_df[['Channel', 'SKU', 'Sales_2026']],
-        on=['Channel', 'SKU'],
-        how='left'
-    )
-    calc_df['Sales_2026'] = calc_df['Sales_2026'].fillna(0.0)
+        if c26 in edited_sku_df.columns:
+            agg_dict[c26] = 'sum'
+    for c27 in MONTH_COLS_27:
+        agg_dict[c27] = 'sum'
+    edited_sku_df = edited_sku_df.groupby('SKU', as_index=False).agg(agg_dict)
+
+calc_df = edited_sku_df.copy()
+merge_26_cols = ['SKU', 'Sales_2026'] + [c for c in MONTH_COLS_26 if c not in calc_df.columns]
+calc_df = calc_df.merge(master_df[merge_26_cols], on='SKU', how='left')
+calc_df['Sales_2026'] = calc_df['Sales_2026'].fillna(0.0)
+for c26 in MONTH_COLS_26:
+    calc_df[c26] = calc_df[c26].fillna(0).astype(int)
 
 calc_df['Qty_2027'] = calc_df[MONTH_COLS_27].sum(axis=1)
 calc_df['Sales_2027'] = calc_df['Qty_2027'] * calc_df['2027_预期供货价($)']
@@ -480,20 +518,20 @@ asp_27 = tot_s27 / tot_q27 if tot_q27 > 0 else 0
 asp_yoy = ((asp_27 - asp_26) / asp_26 * 100) if asp_26 > 0 else 0
 
 st.divider()
-st.subheader("📊 第二步：基于单品汇总的 2027 全年核心预测指标")
+st.subheader("📊 第二步：基于唯一 SKU 汇总的 2027 全年核心预测指标")
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("2027 预估总销量 (Units)", f"{tot_q27:,.0f}", f"{q_yoy:+.1f}% vs 2026 ({tot_q26:,.0f})")
 k2.metric("2027 预估总供货额 ($)", f"${tot_s27:,.2f}", f"{s_yoy:+.1f}% vs 2026 (${tot_s26:,.0f})")
 k3.metric("2027 综合供货均价 (ASP)", f"${asp_27:,.2f}", f"{asp_yoy:+.1f}% vs 2026 (${asp_26:,.2f})")
-k4.metric("活跃预估 SKU 数量", f"{calc_df['SKU'].nunique()} 个", f"总行数 {len(calc_df)} (含双渠道)")
+k4.metric("唯一预估 SKU 总数", f"{calc_df['SKU'].nunique()} 个", "每行对应唯一产品 SKU")
 
 # ---------------------------------------------------------
 # 9. 2027 预估可视化分析与完整报表导出
 # ---------------------------------------------------------
 tab1, tab2, tab3 = st.tabs([
     "📈 1-12月销量与供货额趋势对比",
-    "🏆 单品 SKU 贡献度排行 (Top SKU)",
-    "📋 单品汇总表 & Excel 完整导出"
+    "🏆 唯一 SKU 贡献度排行 (Top SKU)",
+    "📋 唯一 SKU 汇总表 & Excel 完整导出"
 ])
 
 with tab1:
@@ -521,19 +559,17 @@ with tab1:
         st.plotly_chart(fig_s, use_container_width=True)
 
 with tab2:
-    sku_rank = calc_df.groupby(['SKU', 'Brand', 'Category'], as_index=False)[['Qty_2026', 'Qty_2027', 'Sales_2026', 'Sales_2027']].sum()
-    sku_rank = sku_rank.sort_values('Sales_2027', ascending=False).head(15)
-    
+    sku_rank = calc_df.sort_values('Sales_2027', ascending=False).head(15)
     fig_top = px.bar(
         sku_rank, x='SKU', y=['Sales_2026', 'Sales_2027'], barmode='group',
-        title="Top 15 单品 SKU：2026 实际 vs 2027 预估供货额 ($)",
-        hover_data=['Brand', 'Category']
+        title="Top 15 唯一 SKU：2026 实际 vs 2027 预估供货额 ($)",
+        hover_data=['Brand', 'Category', 'Channels']
     )
     st.plotly_chart(fig_top, use_container_width=True)
 
 with tab3:
     summary_view_cols = [
-        'Channel', 'SKU', 'Brand', 'Category', 'Owner',
+        'SKU', 'Channels', 'Brand', 'Category', 'Owner',
         'Qty_2026', 'Qty_2027', '销量同比(%)',
         'ASP_2026', '2027_预期供货价($)', 'Sales_2026', 'Sales_2027'
     ]
@@ -552,16 +588,16 @@ with tab3:
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        calc_df[summary_view_cols].to_excel(writer, sheet_name='1_单品SKU年度预估总览', index=False)
-        qty_detail_cols = ['Channel', 'SKU', 'Brand', 'Category', 'Owner', 'Qty_2026', 'Qty_2027'] + MONTH_COLS_26 + MONTH_COLS_27
-        calc_df[qty_detail_cols].to_excel(writer, sheet_name='2_单品月度销量明细(台)', index=False)
-        sales_detail_cols = ['Channel', 'SKU', 'Brand', 'Category', 'Owner', '2027_预期供货价($)', 'Sales_2027'] + SALES_COLS_27
-        calc_df[sales_detail_cols].to_excel(writer, sheet_name='3_单品2027月度供货额($)', index=False)
+        calc_df[summary_view_cols].to_excel(writer, sheet_name='1_唯一SKU年度预估总览', index=False)
+        qty_detail_cols = ['SKU', 'Channels', 'Brand', 'Category', 'Owner', 'Qty_2026', 'Qty_2027'] + MONTH_COLS_26 + MONTH_COLS_27
+        calc_df[qty_detail_cols].to_excel(writer, sheet_name='2_唯一SKU月度销量明细(台)', index=False)
+        sales_detail_cols = ['SKU', 'Channels', 'Brand', 'Category', 'Owner', '2027_预期供货价($)', 'Sales_2027'] + SALES_COLS_27
+        calc_df[sales_detail_cols].to_excel(writer, sheet_name='3_唯一SKU2027月度供货额($)', index=False)
 
     st.download_button(
-        label="📥 导出 2027 单品 SKU 月度预估完整报表 (Excel)",
+        label="📥 导出 2027 唯一 SKU 月度预估完整报表 (Excel)",
         data=output.getvalue(),
-        file_name="2027_HD_SKU_Monthly_Forecast.xlsx",
+        file_name="2027_HD_Unique_SKU_Monthly_Forecast.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary"
     )
